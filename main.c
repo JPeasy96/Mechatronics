@@ -1,3 +1,4 @@
+
 /* DriverLib Includes */
 #include <ti/devices/msp432p4xx/driverlib/driverlib.h>
 #include "ti/devices/msp432p4xx/inc/msp.h"
@@ -16,6 +17,9 @@
 // state for the double command
 volatile bool handlingDoubleCommand;
 volatile int16_t parsedValue;
+volatile bool debounce_enabled;
+volatile bool red_led_status;
+volatile char rgb_led_status;
 
 // halts the watchdog timer
 void disableWDT(){
@@ -28,6 +32,14 @@ void configLED(uint_fast8_t port, uint_fast8_t pin){
     GPIO_setOutputLowOnPin(port, pin);
 }
 
+void configButton(uint_fast8_t port, uint_fast8_t pin, uint32_t interruptNumber){
+    /* Clears interrupt flags and enable interrupts on the selected button */
+    MAP_GPIO_clearInterruptFlag(port, pin);
+    MAP_GPIO_enableInterrupt(port, pin);
+    MAP_Interrupt_enableInterrupt(interruptNumber);
+    MAP_GPIO_setAsInputPinWithPullUpResistor(port, pin);
+    MAP_GPIO_interruptEdgeSelect(port, pin, GPIO_HIGH_TO_LOW_TRANSITION);
+}
 
 // Configures Timer_A0 for PWM generation on CCRS 1, 2, and 3.
 // Timer_A0's Period is 256, duty cycle of given CCR is TIMER_A0->CCR[n]/256.
@@ -48,6 +60,23 @@ void configTimerA0for3xPWM(){
         TIMER_A0->CCR[2]  = 127; //GREEN
         TIMER_A0->CCR[3]  = 127; //BLUE
 }
+
+void configTimer32forDebouncer(uint32_t timer, uint32_t interruptNumber, uint32_t initialValue){
+    // Configures the Timer32 module for debouncing purposes
+    Timer32_initModule(timer, TIMER32_PRESCALER_1, TIMER32_32BIT, TIMER32_FREE_RUN_MODE);
+    Timer32_clearInterruptFlag(interruptNumber);
+    Interrupt_enableInterrupt(interruptNumber);
+    Timer32_setCount(timer, initialValue);
+}
+
+void configTimer32forStopwatch(uint32_t timer, uint32_t interruptNumber, uint32_t initialValue){
+    //Configures the Timer32 module to act as a stopwatch
+    Timer32_initModule(timer, TIMER32_PRESCALER_256, TIMER32_32BIT, TIMER32_FREE_RUN_MODE);
+    Timer32_clearInterruptFlag(interruptNumber);
+    Interrupt_enableInterrupt(interruptNumber);
+    Timer32_setCount(timer, initialValue);
+}
+
 /* UART Configuration Parameter. These are the configuration parameters to
  * make the eUSCI A UART module to operate with a 9600 baud rate. These
  * values were calculated using the online calculator that TI provides
@@ -57,7 +86,7 @@ void configTimerA0for3xPWM(){
 const eUSCI_UART_Config uartConfig =
 {
         EUSCI_A_UART_CLOCKSOURCE_SMCLK,          // SMCLK Clock Source
-        78,                                     // BRDIV = 78
+        78,                                      // BRDIV = 78
         2,                                       // UCxBRF = 2
         0,                                       // UCxBRS = 0
         EUSCI_A_UART_NO_PARITY,                  // No Parity
@@ -121,6 +150,12 @@ int main(void)
     disableWDT();
 
     // State Variable Initialization: (TODO: will need additional content)
+    handlingDoubleCommand = 0; //Not currently handling double command
+    red_led_status = 0; //Stopwatch is not running
+    rgb_led_status = 'r'; //RGB led initially set to RED
+    parsedValue = 0; //Not currently parsing values
+    debounce_enabled = 0;
+
 
 
     // System Configuration: (TODO: will need additional content)
@@ -129,9 +164,14 @@ int main(void)
     CS_setReferenceOscillatorFrequency(CS_REFO_128KHZ); //128kHz for REF0
     CS_initClockSignal(CS_ACLK, CS_REFOCLK_SELECT, CS_CLOCK_DIVIDER_1); // 128kHz for AClk, from REF0
 
+    configLED(GPIO_PORT_P1, GPIO_PIN0);
     configLED(GPIO_PORT_P2, GPIO_PIN0 | GPIO_PIN1 | GPIO_PIN2);
 
+    configButton(GPIO_PORT_P1, GPIO_PIN1 | GPIO_PIN4, INT_PORT1); //Configure buttons P1.1 and P1.4 to interrupt Port 1
+
     configTimerA0for3xPWM();
+    configTimer32forDebouncer(TIMER32_0_BASE, TIMER32_0_INTERRUPT, 12000);
+    configTimer32forStopwatch(TIMER32_1_BASE, TIMER32_1_INTERRUPT, UINT32_MAX);
 
     configUART();
     duplicateUARTOutputAndRedirectPWM();
@@ -152,19 +192,133 @@ void EUSCIA0_IRQHandler(void)
 
     if(status & EUSCI_A_UART_RECEIVE_INTERRUPT_FLAG)
     {
-        volatile char readdata;
+        volatile uint8_t readdata;
         readdata = UART_receiveData(EUSCI_A0_BASE);
 
-        if(false){
-            ;   // TODO: will need additional content, which may also require modifying the logic above accordingly.
-        }
-        // unrecognized char received while not handlingDoubleCommand:
-        else { //echoes back the character as an unrecognized command
-            printf(EUSCI_A0_BASE, "%c?\n", readdata);
-        }
+        uint32_t ticks_passed;
+        uint32_t time_passed;
+
+        if (handlingDoubleCommand == 0) {
+            //Switch statement to interpret data input
+            switch (readdata) {
+                case 'r' :
+                    rgb_led_status = 'r'; // Prepare for red PWM value
+                    handlingDoubleCommand = 1;
+                    break;
+                case 'g' :
+                    rgb_led_status = 'g'; // Prepare for green PWM value
+                    handlingDoubleCommand = 1;
+                    break;
+                case 'b' :
+                    rgb_led_status = 'b'; // Prepare for blue PWM value
+                    handlingDoubleCommand = 1;
+                    break;
+                case '!' :
+                    Timer32_haltTimer(TIMER32_1_BASE); // Stop timer
+                    MAP_GPIO_setOutputLowOnPin(GPIO_PORT_P1, GPIO_PIN0);
+                    ticks_passed = UINT32_MAX - Timer32_getValue(TIMER32_1_BASE);
+                    time_passed = ticks_passed*256/12000000;
+                    UART_transmitData(EUSCI_A0_BASE, time_passed); // Log previous time via UART
+                    Timer32_setCount(TIMER32_1_BASE, UINT32_MAX); // Reset timer to initial value
+                    break;
+                case 's' :
+                    // Start and stop timer accordingly
+                    if (red_led_status == 0) {
+                        red_led_status = 1;
+                        MAP_GPIO_setOutputHighOnPin(GPIO_PORT_P1, GPIO_PIN0);
+                        Timer32_startTimer(TIMER32_1_BASE, 1);
+                        break;
+                    } else if (red_led_status == 1) {
+                        red_led_status = 0;
+                        MAP_GPIO_setOutputLowOnPin(GPIO_PORT_P1, GPIO_PIN0);
+                        Timer32_haltTimer(TIMER32_1_BASE);
+                        break;
+                    }
+                case 'p' :
+                    ticks_passed = UINT32_MAX - Timer32_getValue(TIMER32_1_BASE);
+                    time_passed = ticks_passed*256/12000000;
+                    UART_transmitData(EUSCI_A0_BASE, time_passed); // Log current stopwatch time without disturbing timer
+                    break;
+                default :
+                    printf(EUSCI_A0_BASE, "%c?\n", readdata);
+                }
+            }
+
+            if (handlingDoubleCommand == 1) {
+                // Parse PWM value and power LEDs accordingly
+                parsedValue = UART_receiveData(EUSCI_A0_BASE);
+
+                switch (rgb_led_status) {
+                    case 'r' :
+                        TIMER_A0->CCR[1] = parsedValue;
+                        handlingDoubleCommand = 0;
+                        break;
+                    case 'g' :
+                        TIMER_A0->CCR[2] = parsedValue;
+                        handlingDoubleCommand = 0;
+                        break;
+                    case 'b' :
+                        TIMER_A0->CCR[3] = parsedValue;
+                        handlingDoubleCommand = 0;
+                        break;
+                }
+            }
     }
 
 }
 
-// TODO: will need additional content and interrupt handlers,
-// depending on which external tools in your microcontroller you decide to use.
+void PORT1_IRQHandler(void) {
+
+    uint32_t status = MAP_GPIO_getEnabledInterruptStatus(GPIO_PORT_P1);
+    MAP_GPIO_clearInterruptFlag(GPIO_PORT_P1, status);
+
+    if (debounce_enabled == 0) {
+        if (status & GPIO_PIN1) {
+        // Switch statement for when P1.1 is pushed
+        // Start or stop stopwatch accordingly
+        // Begin debounce timer
+
+            debounce_enabled = 1;
+            Timer32_setCount(TIMER32_0_BASE, 12000);
+            Timer32_startTimer(TIMER32_0_BASE, 1);
+
+            switch (red_led_status) {
+                case 0:
+                    red_led_status = 1;
+                    MAP_GPIO_setOutputHighOnPin(GPIO_PORT_P1, GPIO_PIN0);
+                    Timer32_startTimer(TIMER32_1_BASE, 1);
+                    break;
+                case 1:
+                    red_led_status = 0;
+                    MAP_GPIO_setOutputLowOnPin(GPIO_PORT_P1, GPIO_PIN0);
+                    Timer32_haltTimer(TIMER32_1_BASE);
+                    break;
+            }
+        } else if (status & GPIO_PIN4) {
+            //Communicate time to console via UART without disturbing the stopwatch
+            // Begin debounce timer
+
+            debounce_enabled = 1;
+            Timer32_setCount(TIMER32_0_BASE, 12000);
+            Timer32_startTimer(TIMER32_0_BASE, 1);
+
+            uint32_t ticks_passed = UINT32_MAX - Timer32_getValue(TIMER32_1_BASE);
+            uint32_t time_passed = ticks_passed*256/12000000;
+            UART_transmitData(EUSCI_A0_BASE, time_passed);
+        }
+    }
+}
+
+void T32_INT0_IRQHandler(void)
+{
+    // Clear debounce flag to allow button presses again
+    debounce_enabled = 0;
+    Timer32_clearInterruptFlag(TIMER32_0_BASE);
+}
+
+void T32_INT1_IRQHandler(void)
+{
+    // Clear interrupt flag if/when stopwatch runs out
+
+    Timer32_clearInterruptFlag(TIMER32_1_BASE);
+}
